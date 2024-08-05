@@ -102,7 +102,7 @@ class TorchTensor:
 
     def delete(self):
         assert self.device is not None, "already deleted"
-        if self.device.device_type == DeviceType.DISK:
+        if self.device.device_type == DeviceType.DISK or self.device.device_type == DeviceType.MIXED:
             self.device.delete(self)
         self.device = self.data = None
 
@@ -656,14 +656,12 @@ class TorchDisk:
     def allocate(self, shape, dtype, pin_memory=None, name=None):
         name = name or TorchTensor.next_name()
         path = os.path.join(self.path, name)
-        print("[DEBUG] creating:", path)
         np.lib.format.open_memmap(path, mode="w+", shape=shape, dtype=dtype)
         return TorchTensor(shape, np_dtype_to_torch_dtype[dtype],
                            path, self, name=name)
 
     def delete(self, tensor):
         if os.path.exists(tensor.data) and tensor.delete_file:
-            print("[DEBUG] removing:", tensor.data)
             os.remove(tensor.data)
 
     def init_cache_one_gpu_batch(self, config, task, policy):
@@ -733,7 +731,7 @@ class TorchMixedDevice:
                            (tensors, seg_points), self, name=name)
 
     def delete(self, tensor):
-        for x in self.tensor.data[0]:
+        for x in tensor.data[0]:
             if x:
                 x.delete()
 
