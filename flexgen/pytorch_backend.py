@@ -656,12 +656,14 @@ class TorchDisk:
     def allocate(self, shape, dtype, pin_memory=None, name=None):
         name = name or TorchTensor.next_name()
         path = os.path.join(self.path, name)
+        print("[DEBUG] creating:", path)
         np.lib.format.open_memmap(path, mode="w+", shape=shape, dtype=dtype)
         return TorchTensor(shape, np_dtype_to_torch_dtype[dtype],
                            path, self, name=name)
 
     def delete(self, tensor):
         if os.path.exists(tensor.data) and tensor.delete_file:
+            print("[DEBUG] removing:", tensor.data)
             os.remove(tensor.data)
 
     def init_cache_one_gpu_batch(self, config, task, policy):
@@ -707,7 +709,7 @@ class TorchMixedDevice:
     def __init__(self, base_devices):
         self.name = "mixed"
         self.device_type = DeviceType.MIXED
-        self.base_devices = base_devices
+        self.base_devices = base_devices # (TorchDevice("cuda:0"), TorchDevice("cpu"), TorchDisk)
 
     def allocate(self, shape, dtype, seg_lengths, pin_memory=None, name=None):
         assert sum(seg_lengths) == shape[SEG_DIM]
@@ -796,6 +798,11 @@ def general_copy(dst: TorchTensor, dst_indices: Tuple[slice],
     >>> env.disk.synchronize()
     >>> torch.cuda.synchronize()
     """
+
+    # print("[DEBUG] general_copy:")
+    # print("\tsrc:", src)
+    # print("\tdst:", dst)
+
     if dst.device.device_type == DeviceType.MIXED:
         # The tensor is on mixed devices, do recursive calls
         assert src.device.device_type != DeviceType.MIXED
@@ -904,3 +911,34 @@ def copy_worker_func(queue, cuda_id):
                 dst_data.copy_(src_data)
 
             queue.task_done()
+
+def reshape_cache_home(old_cache_home, new_device, new_config, new_task, new_policy):
+    # TODO: Use .resize_() or other methods to reshape TorchTensor in place
+    old_k_cache, old_v_cache = old_cache_home
+    new_k_cache, new_v_cache = new_device.init_cache_one_gpu_batch(
+        new_config, new_task, new_policy)
+
+    if not (old_k_cache.device.device_type == DeviceType.MIXED and new_device.device_type == DeviceType.MIXED):
+        general_copy(new_k_cache, None, old_k_cache, None)
+        general_copy(new_v_cache, None, old_v_cache, None)
+        global_disk_device.synchronize()
+        torch.cuda.synchronize()
+        old_k_cache.delete()
+        old_v_cache.delete()
+    else:
+        tmp_k_cache, tmp_v_cache = global_cpu_device.init_cache_one_gpu_batch(
+            new_config, new_task, new_policy)
+        general_copy(tmp_k_cache, None, old_k_cache, None)
+        general_copy(tmp_v_cache, None, old_v_cache, None)
+        global_disk_device.synchronize()
+        torch.cuda.synchronize()
+        old_k_cache.delete()
+        old_v_cache.delete()
+        general_copy(new_k_cache, None, tmp_k_cache, None)
+        general_copy(new_v_cache, None, tmp_v_cache, None)
+        global_disk_device.synchronize()
+        torch.cuda.synchronize()
+        tmp_k_cache.delete()
+        tmp_v_cache.delete()
+
+    return new_k_cache, new_v_cache

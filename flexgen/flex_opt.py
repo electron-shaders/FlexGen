@@ -8,6 +8,8 @@ import dataclasses
 import os
 import pickle
 import time
+from random import uniform as rand_uniform
+from math import floor
 from typing import Union, List, Optional
 
 import numpy as np
@@ -18,7 +20,7 @@ from transformers import AutoTokenizer
 from flexgen.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
 from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
-    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import)
+    TorchMixedDevice, DeviceType, general_copy, fix_recursive_import, reshape_cache_home)
 from flexgen.timer import timers
 from flexgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
@@ -168,6 +170,9 @@ class InputEmbed:
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
 
+    def set_cache_home_one_gpu_batch(self, policy, cache_home):
+        pass  # do nothing
+
     def load_cache(self, cache_home, cache_read_buf, i):
         pass  # do nothing
 
@@ -234,6 +239,9 @@ class OutputEmbed:
                 w_token.smart_copy(dst1)))
 
     def init_cache_one_gpu_batch(self, cache_home):
+        pass  # do nothing
+
+    def set_cache_home_one_gpu_batch(self, policy, cache_home):
         pass  # do nothing
 
     def load_cache(self, cache_home, cache_read_buf, i):
@@ -333,6 +341,25 @@ class SelfAttention:
             device = device.compressed_device
 
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
+        cache_home.store(cache)
+
+    def set_cache_home_one_gpu_batch(self, policy, cache_home):
+        self.policy = policy
+
+        if self.policy.cache_gpu_percent == 100:
+            device = self.env.gpu
+        elif self.policy.cache_cpu_percent == 100:
+            device = self.env.cpu
+        elif self.policy.cache_disk_percent == 100:
+            device = self.env.disk
+        else:
+            device = self.env.mixed
+
+        if self.policy.compress_cache:
+            assert device.device_type != DeviceType.MIXED
+            device = device.compressed_device
+
+        cache = reshape_cache_home(cache_home.pop(), device, self.config, self.task, self.policy)
         cache_home.store(cache)
 
     def load_cache(self, cache_home, cache_read_buf, i):
@@ -507,6 +534,9 @@ class MLP:
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
 
+    def set_cache_home_one_gpu_batch(self, policy, cache_home):
+        pass  # do nothing
+
     def load_cache(self, cache_home, cache_read_buf, i):
         pass  # do nothing
 
@@ -560,6 +590,10 @@ class TransformerLayer:
 
     def init_cache_one_gpu_batch(self, cache_home):
         self.attention.init_cache_one_gpu_batch(cache_home)
+
+    def set_cache_home_one_gpu_batch(self, policy, cache_home):
+        self.policy = policy
+        self.attention.set_cache_home_one_gpu_batch(policy, cache_home)
 
     def load_cache(self, cache_home, cache_read_buf, i):
         self.attention.load_cache(cache_home, cache_read_buf, i)
@@ -673,6 +707,24 @@ class OptLM:
                         y.delete()
                 else:
                     x.delete()
+
+    def set_cache_home(self, cache_gpu_percent, cache_cpu_percent):
+        print(
+            "[DEBUG] set_cache_home: cache_gpu_percent =",
+            cache_gpu_percent,
+            "cache_cpu_percent =",
+            cache_cpu_percent,
+        )
+        self.policy = dataclasses.replace(
+            self.policy,
+            cache_gpu_percent=cache_gpu_percent,
+            cache_cpu_percent=cache_cpu_percent,
+        )
+        for j in range(self.num_layers):
+            for k in range(self.num_gpu_batches):
+                self.layers[j].set_cache_home_one_gpu_batch(
+                    self.policy, self.cache_home[j][k]
+                )
 
     def init_cache(self, j, k):
         self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k])
@@ -1053,6 +1105,16 @@ class OptLM:
                     self.store_cache(i, j, k-1)
                     self.sync()
             timers("generate").stop()
+
+            cache_gpu_percent = floor(rand_uniform(
+                max(0, self.policy.cache_gpu_percent - 10), 
+                min(100, self.policy.cache_gpu_percent + 10)
+            ))
+            cache_cpu_percent = floor(rand_uniform(
+                max(0, self.policy.cache_cpu_percent - 10), 
+                min(100 - cache_gpu_percent, self.policy.cache_cpu_percent + 10)
+            ))
+            self.set_cache_home(cache_gpu_percent, cache_cpu_percent)
 
         # Epilogue
         self.store_hidden(
