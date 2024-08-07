@@ -709,6 +709,9 @@ class OptLM:
                     x.delete()
 
     def set_cache_home(self, cache_gpu_percent, cache_cpu_percent):
+        if self.policy.cache_gpu_percent == cache_gpu_percent and self.policy.cache_cpu_percent == cache_cpu_percent:
+            return
+
         print(
             "[DEBUG] set_cache_home: cache_gpu_percent =",
             cache_gpu_percent,
