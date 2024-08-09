@@ -133,6 +133,44 @@ def init_weight_list(weight_specs, policy, env):
     return ret
 
 
+def set_weight_list(weights, policy, env):
+    dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
+    dev_choices = [env.disk, env.cpu, env.gpu]
+
+    sizes = [np.prod(w.shape) for w in weights]
+    sizes_cumsum = np.cumsum(sizes)
+    ret = []
+    for i in range(len(weights)):
+        mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
+        home = get_choice(mid_percent * 100, dev_percents, dev_choices)
+
+        if weights[i].device == home:
+            ret.append(weights[i])
+            continue
+
+        shape, dtype = weights[i].shape, weights[i].dtype
+        if len(shape) < 2:
+            pin_memory = True
+            compress = False
+        else:
+            pin_memory = policy.pin_weight
+            compress = policy.compress_weight
+
+        if not compress:
+            weight = home.allocate(shape, torch_dtype_to_np_dtype[dtype], pin_memory=pin_memory)
+        else:
+            weight = home.compressed_device.allocate(
+                shape, torch_dtype_to_np_dtype[dtype], policy.comp_weight_config, pin_memory=pin_memory)
+        
+        general_copy(weight, None, weights[i], None)
+        env.disk.synchronize()
+        torch.cuda.synchronize()
+        weights[i].delete()
+
+        ret.append(weight)
+    return ret
+
+
 class InputEmbed:
     def __init__(self, config, env, policy):
         self.config = config
@@ -166,6 +204,11 @@ class InputEmbed:
         if k == 0:
             dst = self.weight_load_dst
             weight_read_buf.store((w_token.smart_copy(dst), w_pos.smart_copy(dst)))
+
+    def set_weight_home(self, weight_home, policy):
+        self.policy = policy
+        weights = set_weight_list(weight_home.pop(), policy, self.env)
+        weight_home.store(weights)
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -237,6 +280,11 @@ class OutputEmbed:
             dst2 = self.compute
             weight_read_buf.store((w_ln.smart_copy(dst2), b_ln.smart_copy(dst2),
                 w_token.smart_copy(dst1)))
+
+    def set_weight_home(self, weight_home, policy):
+        self.policy = policy
+        weights = set_weight_list(weight_home.pop(), policy, self.env)
+        weight_home.store(weights)
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -325,6 +373,11 @@ class SelfAttention:
                 w_v.smart_copy(dst1), b_v.smart_copy(dst2),
                 w_out.smart_copy(dst1), b_out.smart_copy(dst2),
                 w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
+
+    def set_weight_home(self, weight_home, policy):
+        self.policy = policy
+        weights = set_weight_list(weight_home.pop(), policy, self.env)
+        weight_home.store(weights)
 
     def init_cache_one_gpu_batch(self, cache_home):
         if self.policy.cache_gpu_percent == 100:
@@ -476,12 +529,12 @@ class SelfAttention:
             cache_write_buf.store((new_k_cache, new_v_cache))
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
-            (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
+            (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop() # device: CUDA
             h, new_k_cache, new_v_cache = self.compute.mha_gen(h, mask, w_q,
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
                 self.policy.compress_cache, self.policy.comp_cache_config)
-            cache_write_buf.store((new_k_cache, new_v_cache))
+            cache_write_buf.store((new_k_cache, new_v_cache)) # device: CUDA
 
         hidden.val = h
 
@@ -530,6 +583,11 @@ class MLP:
                 wi.smart_copy(dst1), bi.smart_copy(dst2),
                 wo.smart_copy(dst1), bo.smart_copy(dst2),
                 w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
+
+    def set_weight_home(self, weight_home, policy):
+        self.policy = policy
+        weights = set_weight_list(weight_home.pop(), self.policy, self.env)
+        weight_home.store(weights)
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -587,6 +645,13 @@ class TransformerLayer:
         self.mlp.load_weight(home2, read_buf2, k)
         if k == 0:
             weight_read_buf.store((read_buf1, read_buf2))
+
+    def set_weight_home(self, weight_home, policy):
+        self.policy = policy
+        home1, home2 = weight_home.pop()
+        self.attention.set_weight_home(home1, policy)
+        self.mlp.set_weight_home(home2, policy)
+        weight_home.store((home1, home2))
 
     def init_cache_one_gpu_batch(self, cache_home):
         self.attention.init_cache_one_gpu_batch(cache_home)
@@ -858,6 +923,24 @@ class OptLM:
         for j in range(self.num_layers):
             self.delete_weight(j, 0)
 
+    def set_weight_home(self, weight_gpu_percent, weight_cpu_percent):
+        if self.policy.w_gpu_percent == weight_gpu_percent and self.policy.w_cpu_percent == weight_cpu_percent:
+            return
+
+        print(
+            "[DEBUG] set_all_weight_homes: weight_gpu_percent =",
+            weight_gpu_percent,
+            "weight_cpu_percent =",
+            weight_cpu_percent,
+        )
+        self.policy = dataclasses.replace(
+            self.policy,
+            w_gpu_percent=weight_gpu_percent,
+            w_cpu_percent=weight_cpu_percent,
+        )
+        for j in range(self.num_layers):
+            self.layers[j].set_weight_home(self.weight_home[j], self.policy)
+
     def update_attention_mask(self, i, k):
         if i > 0:
             mask = self.attention_mask[k]
@@ -885,7 +968,9 @@ class OptLM:
                  stop: Optional[int] = None,
                  debug_mode: Optional[str] = None,
                  cut_gen_len: Optional[int] = None,
-                 verbose: int = 0):
+                 verbose: int = 0,
+                 reallocate_timing: int = 0,
+                 include_reallocate_punishment: bool = False):
         task = Task(
             inputs=inputs,
             prompt_len=len(inputs[0]),
@@ -940,9 +1025,9 @@ class OptLM:
             else:
                 # Overlap I/O and compute
                 if num_gpu_batches == 1:
-                    self.generation_loop_overlap_single_batch()
+                    self.generation_loop_overlap_single_batch(reallocate_timing, include_reallocate_punishment)
                 else:
-                    self.generation_loop_overlap_multi_batch()
+                    self.generation_loop_overlap_multi_batch(reallocate_timing, include_reallocate_punishment)
         elif debug_mode == "fewer_batch":
             # Run fewer layeres and batches for debugging
             if num_gpu_batches == 1:
@@ -1063,11 +1148,19 @@ class OptLM:
                 costs = timers(name).costs
                 print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
 
-    def generation_loop_overlap_single_batch(self):
+    def generation_loop_overlap_single_batch(self, reallocate_timing, include_reallocate_punishment):
         # Prologue
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, k)
         self.sync()
+
+        if reallocate_timing == 1 and self.task.gen_len != 1: # change bfr gen
+            weight_gpu_percent = floor(rand_uniform(
+                max(0, self.policy.w_gpu_percent), 
+                min(100, self.policy.w_gpu_percent + 5)
+            ))
+            weight_cpu_percent = 100 - weight_gpu_percent
+            self.set_weight_home(weight_gpu_percent, weight_cpu_percent)
 
         # Generate
         for i in range(self.execute_gen_len):
@@ -1081,17 +1174,46 @@ class OptLM:
                 self.store_cache(i, j-1, 0)
                 self.store_hidden(i, j, 0)
                 self.sync()
+
+            if include_reallocate_punishment == True and (reallocate_timing == 2 or # change-in-flight (every token)
+                reallocate_timing == 3 and int(rand_uniform(0, 1) + 0.5)): # change-in-flight (some token)
+                weight_gpu_percent = floor(rand_uniform(
+                    max(0, self.policy.w_gpu_percent), 
+                    min(100, self.policy.w_gpu_percent + 2)
+                ))
+                weight_cpu_percent = 100 - weight_gpu_percent
+                self.set_cache_home(weight_gpu_percent, weight_cpu_percent)
             timers("generate").stop()
 
             if self.task.stop and np.all(self.stopped):
                 break
 
-    def generation_loop_overlap_multi_batch(self):
+            if include_reallocate_punishment == False and (reallocate_timing == 2 or # change-in-flight (every token)
+               reallocate_timing == 3 and int(rand_uniform(0, 1) + 0.5)): # change-in-flight (some token)
+                weight_gpu_percent = floor(rand_uniform(
+                    max(0, self.policy.w_gpu_percent), 
+                    min(100, self.policy.w_gpu_percent + 2)
+                ))
+                weight_cpu_percent = 100 - weight_gpu_percent
+                self.set_cache_home(weight_gpu_percent, weight_cpu_percent)
+
+    def generation_loop_overlap_multi_batch(self, reallocate_timing, include_reallocate_punishment):
         # Prologue
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, k)
         self.load_hidden(0, 0, 0)
         self.sync()
+
+        if reallocate_timing == 1 and self.task.gen_len != 1: # change bfr gen
+            weight_gpu_percent = floor(rand_uniform(
+                max(0, self.policy.w_gpu_percent), 
+                min(100, self.policy.w_gpu_percent + 5)
+            ))
+            weight_cpu_percent = floor(rand_uniform(
+                max(0, self.policy.w_cpu_percent - 2), 
+                min(100 - weight_gpu_percent, self.policy.w_cpu_percent + 5)
+            ))
+            self.set_cache_home(weight_gpu_percent, weight_cpu_percent)
 
         # Generate
         for i in range(self.execute_gen_len):
@@ -1107,17 +1229,31 @@ class OptLM:
                     self.compute_layer(i, j, k)
                     self.store_cache(i, j, k-1)
                     self.sync()
+
+            if include_reallocate_punishment == True and (reallocate_timing == 2 or # change-in-flight (every token)
+               reallocate_timing == 3 and int(rand_uniform(0, 1) + 0.5)): # change-in-flight (some token)
+                weight_gpu_percent = floor(rand_uniform(
+                    max(0, self.policy.w_gpu_percent - 2), 
+                    min(100, self.policy.w_gpu_percent + 2)
+                ))
+                weight_cpu_percent = floor(rand_uniform(
+                    max(0, self.policy.w_cpu_percent - 2), 
+                    min(100 - weight_gpu_percent, self.policy.w_cpu_percent + 2)
+                ))
+                self.set_cache_home(weight_gpu_percent, weight_cpu_percent)
             timers("generate").stop()
 
-            cache_gpu_percent = floor(rand_uniform(
-                max(0, self.policy.cache_gpu_percent - 10), 
-                min(100, self.policy.cache_gpu_percent + 10)
-            ))
-            cache_cpu_percent = floor(rand_uniform(
-                max(0, self.policy.cache_cpu_percent - 10), 
-                min(100 - cache_gpu_percent, self.policy.cache_cpu_percent + 10)
-            ))
-            self.set_cache_home(cache_gpu_percent, cache_cpu_percent)
+            if include_reallocate_punishment == False and (reallocate_timing == 2 or # change-in-flight (every token)
+               reallocate_timing == 3 and int(rand_uniform(0, 1) + 0.5)): # change-in-flight (some token)
+                weight_gpu_percent = floor(rand_uniform(
+                    max(0, self.policy.w_gpu_percent - 2), 
+                    min(100, self.policy.w_gpu_percent + 2)
+                ))
+                weight_cpu_percent = floor(rand_uniform(
+                    max(0, self.policy.w_cpu_percent - 2), 
+                    min(100 - weight_gpu_percent, self.policy.w_cpu_percent + 2)
+                ))
+                self.set_cache_home(weight_gpu_percent, weight_cpu_percent)
 
         # Epilogue
         self.store_hidden(
@@ -1292,7 +1428,8 @@ def run_flexgen(args):
         timers("generate").reset()
         output_ids = model.generate(
             inputs, max_new_tokens=args.gen_len,
-            debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose)
+            debug_mode=args.debug_mode, cut_gen_len=cut_gen_len, verbose=args.verbose,
+            reallocate_timing=args.reallocate_timing, include_reallocate_punishment=args.include_reallocate_punish)
         costs = timers("generate").costs
     finally:
         env.close_copy_threads()
@@ -1379,6 +1516,10 @@ def add_parser_arguments(parser):
     parser.add_argument("--verbose", type=int, default=2)
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
+        const=True, default=True)
+
+    parser.add_argument("--reallocate-timing", type=int, default=0)
+    parser.add_argument("--include-reallocate-punish", type=str2bool, nargs='?',
         const=True, default=True)
 
 

@@ -56,6 +56,26 @@ suite_6b7_1x1_comp = [
     Case("--model facebook/opt-6.7b --path _DUMMY_ --percent 100 0 100 0 100 0 --gpu-batch-size 28 --overlap False --compress-weight --compress-cache --prompt-len 1024"),
 ]
 
+suite_6b7_1x1_reallocate = [
+    Case("--model facebook/opt-6.7b --percent 100 0 83 17 100 0 --gpu-batch-size 1 --num-gpu-batches 1 --prompt-len 512 --gen-len 1288", "opt-6.7b: Fitted ratios"),
+    Case("--model facebook/opt-6.7b --percent 100 0 83 17 100 0 --gpu-batch-size 1 --num-gpu-batches 1 --prompt-len 512 --gen-len 1288 --reallocate-timing 1", "opt-6.7b: Reallocate before generate"),
+    Case("--model facebook/opt-6.7b --percent 100 0 83 17 100 0 --gpu-batch-size 1 --num-gpu-batches 1 --prompt-len 512 --gen-len 1288 --reallocate-timing 2", "opt-6.7b: Reallocate-in-flight (every token)"),
+    Case("--model facebook/opt-6.7b --percent 100 0 83 17 100 0 --gpu-batch-size 1 --num-gpu-batches 1 --prompt-len 512 --gen-len 1288 --reallocate-timing 3", "opt-6.7b: Reallocate-in-flight (after some tokens)"),
+    Case("--model facebook/opt-6.7b --percent 100 0 83 17 100 0 --gpu-batch-size 1 --num-gpu-batches 1 --prompt-len 512 --gen-len 1288 --reallocate-timing 1 --include-reallocate-punish true", "opt-6.7b: Reallocate before generate, with punish"),
+    Case("--model facebook/opt-6.7b --percent 100 0 83 17 100 0 --gpu-batch-size 1 --num-gpu-batches 1 --prompt-len 512 --gen-len 1288 --reallocate-timing 2 --include-reallocate-punish true", "opt-6.7b: Reallocate-in-flight (every token), with punish"),
+    Case("--model facebook/opt-6.7b --percent 100 0 83 17 100 0 --gpu-batch-size 1 --num-gpu-batches 1 --prompt-len 512 --gen-len 1288 --reallocate-timing 3 --include-reallocate-punish true", "opt-6.7b: Reallocate-in-flight (after some tokens), with punish"),
+]
+
+suite_13b_1x1_reallocate = [
+    Case("--model facebook/opt-13b --percent 34 66 0 95 0 100 --gpu-batch-size 64 --num-gpu-batches 6 --prompt-len 384 --gen-len 128", "opt-13b: Fitted ratios"),
+    Case("--model facebook/opt-13b --percent 34 66 0 95 0 100 --gpu-batch-size 64 --num-gpu-batches 6 --prompt-len 384 --gen-len 128 --reallocate-timing 1", "opt-13b: Reallocate before generate"),
+    Case("--model facebook/opt-13b --percent 34 66 0 95 0 100 --gpu-batch-size 64 --num-gpu-batches 6 --prompt-len 384 --gen-len 128 --reallocate-timing 2", "opt-13b: Reallocate-in-flight (every token)"),
+    Case("--model facebook/opt-13b --percent 34 66 0 95 0 100 --gpu-batch-size 64 --num-gpu-batches 6 --prompt-len 384 --gen-len 128 --reallocate-timing 3", "opt-13b: Reallocate-in-flight (after some tokens)"),
+    Case("--model facebook/opt-13b --percent 34 66 0 95 0 100 --gpu-batch-size 64 --num-gpu-batches 6 --prompt-len 384 --gen-len 128 --reallocate-timing 1 --include-reallocate-punish true", "opt-13b: Reallocate before generate, with punish"),
+    Case("--model facebook/opt-13b --percent 34 66 0 95 0 100 --gpu-batch-size 64 --num-gpu-batches 6 --prompt-len 384 --gen-len 128 --reallocate-timing 2 --include-reallocate-punish true", "opt-13b: Reallocate-in-flight (every token), with punish"),
+    Case("--model facebook/opt-13b --percent 34 66 0 95 0 100 --gpu-batch-size 64 --num-gpu-batches 6 --prompt-len 384 --gen-len 128 --reallocate-timing 3 --include-reallocate-punish true", "opt-13b: Reallocate-in-flight (after some tokens), with punish"),
+]
+
 suite_30b_1x1 = [
     # seq_len = 256, gen_len = 32
     # 16.01 token/s
@@ -75,6 +95,16 @@ suite_30b_1x1_comp = [
     # Case("--model facebook/opt-30b --path _DUMMY_ --percent 0 100 0 100 0 100 --gpu-batch-size 16 --num-gpu-batches 20 --debug fewer_batch --compress-cache"),
     # seq_len = 1024, gen_len = 32
     Case("--model facebook/opt-30b --path _DUMMY_ --percent 0 100 0 100 0 100 --gpu-batch-size 20 --num-gpu-batches 12 --debug fewer_batch --compress-cache --prompt-len 1024"),
+]
+
+suite_30b_1x1_reallocate = [
+    Case("--model facebook/opt-30b --percent 12 78 0 100 0 100 --gpu-batch-size 32 --num-gpu-batches 5 --prompt-len 512 --gen-len 32", "opt-30b: Fitted ratios"),
+    Case("--model facebook/opt-30b --percent 12 78 0 100 0 100 --gpu-batch-size 32 --num-gpu-batches 5 --prompt-len 512 --gen-len 32 --reallocate-timing 1", "opt-30b: Reallocate before generate"),
+    Case("--model facebook/opt-30b --percent 12 78 0 100 0 100 --gpu-batch-size 32 --num-gpu-batches 5 --prompt-len 512 --gen-len 32 --reallocate-timing 2", "opt-30b: Reallocate-in-flight (every token)"),
+    Case("--model facebook/opt-30b --percent 12 78 0 100 0 100 --gpu-batch-size 32 --num-gpu-batches 5 --prompt-len 512 --gen-len 32 --reallocate-timing 3", "opt-30b: Reallocate-in-flight (after some tokens)"),
+    Case("--model facebook/opt-30b --percent 12 78 0 100 0 100 --gpu-batch-size 32 --num-gpu-batches 5 --prompt-len 512 --gen-len 32 --reallocate-timing 1 --include-reallocate-punish true", "opt-30b: Reallocate before generate, with punish"),
+    Case("--model facebook/opt-30b --percent 12 78 0 100 0 100 --gpu-batch-size 32 --num-gpu-batches 5 --prompt-len 512 --gen-len 32 --reallocate-timing 2 --include-reallocate-punish true", "opt-30b: Reallocate-in-flight (every token), with punish"),
+    Case("--model facebook/opt-30b --percent 12 78 0 100 0 100 --gpu-batch-size 32 --num-gpu-batches 5 --prompt-len 512 --gen-len 32 --reallocate-timing 3 --include-reallocate-punish true", "opt-30b: Reallocate-in-flight (after some tokens), with punish"),
 ]
 
 suite_175b_1x1 = [
@@ -158,9 +188,13 @@ suites = {
 
     "6b7_1x1": suite_6b7_1x1,
     "6b7_1x1_comp": suite_6b7_1x1_comp,
+    "6b7_1x1_reallocate": suite_6b7_1x1_reallocate,
+
+    "13b_1x1_reallocate": suite_13b_1x1_reallocate,
 
     "30b_1x1": suite_30b_1x1,
     "30b_1x1_comp": suite_30b_1x1_comp,
+    "30b_1x1_reallocate": suite_30b_1x1_reallocate,
 
     "175b_1x1": suite_175b_1x1,
     "175b_1x1_comp": suite_175b_1x1_comp,
