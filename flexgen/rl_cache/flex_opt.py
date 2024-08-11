@@ -981,8 +981,8 @@ class OptLM:
             stop=stop,
         )
         num_layers = self.num_layers
-        num_gpu_batches = self.num_gpu_batches
-        gpu_batch_size = self.policy.gpu_batch_size
+        # num_gpu_batches = self.num_gpu_batches
+        # gpu_batch_size = self.policy.gpu_batch_size
         overlap = self.policy.overlap
         prompt_len, gen_len = task.prompt_len, task.gen_len
         self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
@@ -992,53 +992,41 @@ class OptLM:
             self.config.pad_token_id, dtype=np.int32)
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
-        assert gpu_batch_size * num_gpu_batches == len(task.inputs)
+        # assert gpu_batch_size * num_gpu_batches == len(task.inputs)
 
-        # Intermediate tensors
-        # The following buffers store values used
-        # for the i-th token, j-th layer, k-th gpu batch.
-        num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
-        for j in range(num_layers):
+
+        num_layers = self.num_layers
+        
+        batch_sizes = [2, 4, 8, 16, 32]
+        cache_gpu_percents = [80, 60, 40, 20, 0]
+        for batch_size, cache_gpu_percent in zip(batch_sizes, cache_gpu_percents):
+            self.policy.gpu_batch_size = batch_size
+            self.policy.cache_cpu_percent = cache_gpu_percent
+            self.policy.cache_gpu_percent = 100 - cache_gpu_percent
+            num_gpu_batches = 1 
+            # Intermediate tensors
+            # The following buffers store values used
+            for j in range(num_layers):
+                for k in range(num_gpu_batches):
+                    self.cache_home[j][k].clear()
+                    self.cache_read_buf[j][k].clear()
+                    self.cache_write_buf[j][k].clear()
+            # for j in range(num_layers):
+            #     self.weight_read_buf[j].clear()
             for k in range(num_gpu_batches):
-                self.cache_home[j][k].clear()
-                self.cache_read_buf[j][k].clear()
-                self.cache_write_buf[j][k].clear()
-        for j in range(num_layers):
-            self.weight_read_buf[j].clear()
-        for k in range(num_gpu_batches):
-            self.attention_mask[k].clear()
-        self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
+                self.attention_mask[k].clear()
+            self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
 
-        # Init cache
-        self.set_task(task)
-        for j in range(num_layers):
-            for k in range(num_gpu_batches):
-                self.init_cache(j, k)
-        if self.policy.cpu_cache_compute:
-            self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
+            # Init cache
+            self.set_task(task)
+            for j in range(num_layers):
+                for k in range(num_gpu_batches):
+                    self.init_cache(j, k)
+            if self.policy.cpu_cache_compute:
+                self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
 
-        # Generate
-        if debug_mode is None:
-            if not overlap:
-                # No overlap, easy to understand, suitable for debugging
-                self.generation_loop_normal()
-            else:
-                # Overlap I/O and compute
-                if num_gpu_batches == 1:
-                    self.generation_loop_overlap_single_batch(reallocate_timing, include_reallocate_punishment)
-                else:
-                    self.generation_loop_overlap_multi_batch(reallocate_timing, include_reallocate_punishment)
-        elif debug_mode == "fewer_batch":
-            # Run fewer layeres and batches for debugging
-            if num_gpu_batches == 1:
-                self.generation_loop_debug_single_batch()
-            else:
-                self.generation_loop_debug_multi_batch()
-        elif debug_mode == "breakdown":
-            # No overlap, fewer batches, execution time breakdown
-            self.generation_loop_debug_normal()
-        else:
-            raise ValueError("Invalid debug mode: {debug_mode}")
+            self.generation_loop_overlap_single_batch(reallocate_timing, include_reallocate_punishment)
+                   
 
         # Delete cache
         for j in range(num_layers):
