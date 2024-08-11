@@ -9,15 +9,21 @@ import os
 import pickle
 import time
 from typing import Union, List, Optional
+import sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, current_dir)
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
 
 import numpy as np
 from tqdm import tqdm
 import torch
 from transformers import AutoTokenizer
 
-from flexgen.compression import CompressionConfig
+from rl_cache.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
-from flexgen.pytorch_backend import (
+from rl_cache.pytorch_backend import (
     TorchDevice,
     TorchDisk,
     TorchLink,

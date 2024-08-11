@@ -24,7 +24,7 @@ global_disk_device = None
 
 def fix_recursive_import():
     global general_copy_compressed, TorchCompressedDevice, global_cpu_device
-    from flexgen import compression
+    from rl_cache import compression
     general_copy_compressed = compression.general_copy_compressed
     TorchCompressedDevice = compression.TorchCompressedDevice
 
