@@ -1088,27 +1088,28 @@ class OptLM:
             )
 
         # Generate
-        if debug_mode is None:
-            if not overlap:
-                # No overlap, easy to understand, suitable for debugging
-                self.generation_loop_normal()
-            else:
-                # Overlap I/O and compute
-                if num_gpu_batches == 1:
-                    self.generation_loop_overlap_single_batch()
-                else:
-                    self.generation_loop_overlap_multi_batch()
-        elif debug_mode == "fewer_batch":
-            # Run fewer layeres and batches for debugging
-            if num_gpu_batches == 1:
-                self.generation_loop_debug_single_batch()
-            else:
-                self.generation_loop_debug_multi_batch()
-        elif debug_mode == "breakdown":
-            # No overlap, fewer batches, execution time breakdown
-            self.generation_loop_debug_normal()
-        else:
-            raise ValueError("Invalid debug mode: {debug_mode}")
+        # if debug_mode is None:
+        #     if not overlap:
+        #         # No overlap, easy to understand, suitable for debugging
+        #         self.generation_loop_normal()
+        #     else:
+        #         # Overlap I/O and compute
+        #         if num_gpu_batches == 1:
+        #             self.generation_loop_overlap_single_batch()
+        #         else:
+        #             self.generation_loop_overlap_multi_batch()
+        # elif debug_mode == "fewer_batch":
+        #     # Run fewer layeres and batches for debugging
+        #     if num_gpu_batches == 1:
+        #         self.generation_loop_debug_single_batch()
+        #     else:
+        #         self.generation_loop_debug_multi_batch()
+        # elif debug_mode == "breakdown":
+        #     # No overlap, fewer batches, execution time breakdown
+        #     self.generation_loop_debug_normal()
+        # else:
+        #     raise ValueError("Invalid debug mode: {debug_mode}")
+        self.generation_loop_overlap_single_batch()
 
         # Delete cache
         # if batch_idx == -1:
@@ -1473,19 +1474,24 @@ def run_flexgen(args):
         print("benchmark - generate")
         timers("generate").reset()
         batch_sizes = [2, 4, 8, 16, 32]
-        cache_gpu_percents = [80, 60, 40, 20, 0]
+        cache_gpu_percents = [20, 40, 60, 80, 100]
+        w_gpu_percents = [100, 80, 60, 40, 20]
 
-        for batch_idx, (batch_size, cache_gpu_percent) in enumerate(
-            zip(batch_sizes, cache_gpu_percents)
-        ):
+        for batch_idx, (
+            batch_size,
+            cache_gpu_percent,
+            w_gpu_percents,
+        ) in enumerate(zip(batch_sizes, cache_gpu_percents, w_gpu_percents)):
             if batch_idx == 4:
                 batch_idx = -1
             policy.gpu_batch_size = batch_size
             policy.num_gpu_batches = 1
-            policy.cache_cpu_percent = cache_gpu_percent
-            policy.cache_gpu_percent = 100 - cache_gpu_percent
+            policy.cache_gpu_percent = cache_gpu_percent
+            policy.cache_cpu_percent = 100 - cache_gpu_percent
+            policy.w_gpu_percent = w_gpu_percents
+            policy.w_cpu_percent = 100 - w_gpu_percents
             inputs = get_test_inputs(prompt_len, batch_size, tokenizer)
-            print('len(inputs):', len(inputs))
+            print("len(inputs):", len(inputs))
             output_ids = model.generate(
                 batch_idx,
                 policy,
