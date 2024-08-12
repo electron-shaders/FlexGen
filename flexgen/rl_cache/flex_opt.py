@@ -55,7 +55,7 @@ fix_recursive_import()
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=False)
 class Policy:
     gpu_batch_size: int
     num_gpu_batches: int
@@ -1017,6 +1017,7 @@ class OptLM:
         val = attention_compute.allocate(
             (self.policy.gpu_batch_size, self.task.prompt_len), bool
         )
+        print("gpu_batch_size:", gpu_batch_size)
         val.load_from_np((input_ids != self.config.pad_token_id))
         self.attention_mask[k].store(val)
 
@@ -1058,7 +1059,7 @@ class OptLM:
         )
         self.stopped = np.zeros((len(task.inputs), 1), dtype=bool)
         self.output_ids[:, :prompt_len] = np.asarray(task.inputs)
-        assert gpu_batch_size * num_gpu_batches == len(task.inputs)
+        # assert gpu_batch_size * num_gpu_batches == len(task.inputs)
 
         # Intermediate tensors
         # The following buffers store values used
@@ -1072,9 +1073,9 @@ class OptLM:
                     self.cache_write_buf[j][k].clear()
             for j in range(num_layers):
                 self.weight_read_buf[j].clear()
-            for k in range(num_gpu_batches):
-                self.attention_mask[k].clear()
             self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
+        for k in range(num_gpu_batches):
+            self.attention_mask[k].clear()
 
         # Init cache
         self.set_task(task)
@@ -1110,12 +1111,12 @@ class OptLM:
             raise ValueError("Invalid debug mode: {debug_mode}")
 
         # Delete cache
-        if batch_idx == -1:
-            for j in range(num_layers):
-                for k in range(num_gpu_batches):
-                    self.delete_cache(j, k)
-            if self.policy.cpu_cache_compute:
-                self.env.cpu.del_attention_compute_workspace()
+        # if batch_idx == -1:
+        for j in range(num_layers):
+            for k in range(num_gpu_batches):
+                self.delete_cache(j, k)
+        if self.policy.cpu_cache_compute:
+            self.env.cpu.del_attention_compute_workspace()
 
         return self.output_ids
 
@@ -1422,7 +1423,6 @@ def run_flexgen(args):
 
     # Task and policy
     warmup_inputs = get_test_inputs(32, num_prompts, tokenizer)
-    inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
 
     gpu = TorchDevice("cuda:0")
     cpu = TorchDevice("cpu")
@@ -1467,7 +1467,7 @@ def run_flexgen(args):
     try:
         print("warmup - generate")
         output_ids = model.generate(
-            warmup_inputs, 0, policy, max_new_tokens=1, verbose=args.verbose
+            0, policy, warmup_inputs, max_new_tokens=1, verbose=args.verbose
         )
 
         print("benchmark - generate")
@@ -1484,6 +1484,8 @@ def run_flexgen(args):
             policy.num_gpu_batches = 1
             policy.cache_cpu_percent = cache_gpu_percent
             policy.cache_gpu_percent = 100 - cache_gpu_percent
+            inputs = get_test_inputs(prompt_len, batch_size, tokenizer)
+            print('len(inputs):', len(inputs))
             output_ids = model.generate(
                 batch_idx,
                 policy,
@@ -1564,7 +1566,7 @@ def add_parser_arguments(parser):
         default="~/flexgen_offload_dir",
         help="The directory to offload tensors. ",
     )
-    parser.add_argument("--prompt-len", type=int, default=512)
+    parser.add_argument("--prompt-len", type=int, default=32)
     parser.add_argument("--gen-len", type=int, default=32)
     parser.add_argument(
         "--cut-gen-len", type=int, help="Cut generation length for fast debugging."
