@@ -195,6 +195,7 @@ class InputEmbed:
         if k == 0:
             dst = self.weight_load_dst
             weight_read_buf.store((w_token.smart_copy(dst), w_pos.smart_copy(dst)))
+        return {w_token.device.name: w_token.bytes, w_pos.device.name: w_pos.bytes}
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -273,6 +274,11 @@ class OutputEmbed:
             weight_read_buf.store(
                 (w_ln.smart_copy(dst2), b_ln.smart_copy(dst2), w_token.smart_copy(dst1))
             )
+        return {
+            w_ln.device.name: w_ln.bytes,
+            b_ln.device.name: b_ln.bytes,
+            w_token.device.name: w_token.bytes,
+        }
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -381,6 +387,18 @@ class SelfAttention:
                     b_ln.smart_copy(dst2),
                 )
             )
+        return {
+            w_q.device.name: w_q.bytes,
+            b_q.device.name: b_q.bytes,
+            w_k.device.name: w_k.bytes,
+            b_k.device.name: b_k.bytes,
+            w_v.device.name: w_v.bytes,
+            b_v.device.name: b_v.bytes,
+            w_out.device.name: w_out.bytes,
+            b_out.device.name: b_out.bytes,
+            w_ln.device.name: w_ln.bytes,
+            b_ln.device.name: b_ln.bytes,
+        }
 
     def init_cache_one_gpu_batch(self, cache_home):
         if self.policy.cache_gpu_percent == 100:
@@ -655,6 +673,14 @@ class MLP:
                     b_ln.smart_copy(dst2),
                 )
             )
+        return {
+            wi.device.name: wi.bytes,
+            bi.device.name: bi.bytes,
+            wo.device.name: wo.bytes,
+            bo.device.name: bo.bytes,
+            w_ln.device.name: w_ln.bytes,
+            b_ln.device.name: b_ln.bytes,
+        }
 
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
@@ -720,10 +746,17 @@ class TransformerLayer:
     def load_weight(self, weight_home, weight_read_buf, k):
         read_buf1, read_buf2 = ValueHolder(), ValueHolder()
         home1, home2 = weight_home.val
-        self.attention.load_weight(home1, read_buf1, k)
-        self.mlp.load_weight(home2, read_buf2, k)
+        attn_stats = self.attention.load_weight(home1, read_buf1, k)
+        mlp_stats = self.mlp.load_weight(home2, read_buf2, k)
         if k == 0:
             weight_read_buf.store((read_buf1, read_buf2))
+
+        combined_stats = {}
+        for stats in [attn_stats, mlp_stats]:
+            for dev_name, size in stats.items():
+                combined_stats[dev_name] = combined_stats.get(dev_name, 0) + size
+
+        return combined_stats
 
     def init_cache_one_gpu_batch(self, cache_home):
         self.attention.init_cache_one_gpu_batch(cache_home)
@@ -840,11 +873,30 @@ class OptLM:
         # Load from weight_home to weight_read_buf
         if overlap:
             with torch.cuda.stream(self.load_weight_stream):
-                self.layers[j].load_weight(
+                layer_weight_stats = self.layers[j].load_weight(
                     self.weight_home[j], self.weight_read_buf[j], k
                 )
         else:
             self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
+
+        if j == 0:
+            self.weight_stats = {
+                dev.name: 0 for dev in [self.env.gpu, self.env.cpu, self.env.disk]
+            }
+            self.total_weight_size = 0
+        for dev_name, size in layer_weight_stats.items():
+            self.weight_stats[dev_name] += size
+            self.total_weight_size += size
+
+        print("Weight Distribution:")
+        for dev_name, size in self.weight_stats.items():
+            percent = (
+                (size / self.total_weight_size) * 100
+                if self.total_weight_size > 0
+                else 0
+            )
+            print(f"  {dev_name}: {percent:.2f}% ({size / GB:.2f} GB)")
+        print(f"Total Weight Size: {self.total_weight_size / GB:.2f} GB")
 
     def delete_weight(self, j, k):
         if k == 0:
