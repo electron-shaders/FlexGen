@@ -399,7 +399,7 @@ class SelfAttention:
                     b_ln.smart_copy(dst2),
                 )
             )
-            
+
         weight_stats = {}
         for weight in [w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln]:
             if weight.device.name in weight_stats:
@@ -682,14 +682,14 @@ class MLP:
                     b_ln.smart_copy(dst2),
                 )
             )
-            
+
         weight_stats = {}
         for weight in [wi, bi, wo, bo, w_ln, b_ln]:
             if weight.device.name in weight_stats:
                 weight_stats[weight.device.name] += weight.bytes
             else:
                 weight_stats[weight.device.name] = weight.bytes
-        
+
         return weight_stats
 
     def init_cache_one_gpu_batch(self, cache_home):
@@ -887,12 +887,13 @@ class OptLM:
                 dev.name: 0 for dev in [self.env.gpu, self.env.cpu, self.env.disk]
             }
             self.total_weight_size = 0
-            
+
         for dev_name, size in layer_weight_stats.items():
             self.weight_stats[dev_name] += size
             self.total_weight_size += size
 
-        if j == self.num_layers - 1:
+        ret = {}
+        if j == self.num_layers - 1 and i == self.execute_gen_len - 1:
             for dev_name, size in self.weight_stats.items():
                 percent = (
                     (size / self.total_weight_size) * 100
@@ -900,7 +901,9 @@ class OptLM:
                     else 0
                 )
                 print(f"{dev_name}: {percent:.2f}% ({size / GB:.2f} GB)")
+                ret[dev_name] = percent
             print(f"Total Weight Size: {self.total_weight_size / GB:.2f} GB")
+        return ret
 
     def delete_weight(self, j, k):
         if k == 0:
@@ -1294,7 +1297,7 @@ class OptLM:
             timers("generate").start()
             self.update_attention_mask(i, 0)
             for j in range(self.num_layers):
-                self.load_weight(i, j + 1, 0)
+                w_percent = self.load_weight(i, j + 1, 0)
                 self.load_cache(i, j + 1, 0)
                 self.load_hidden(i, j, 0)
                 self.compute_layer(i, j, 0)
