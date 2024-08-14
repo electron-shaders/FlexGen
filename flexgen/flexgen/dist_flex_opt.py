@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 
-from flexgen.compression import CompressionConfig
+from flexgen.original.compression import CompressionConfig
 from flexgen.dist_utils import initialize_distributed
 from flexgen.flex_opt import (Policy, InputEmbed, OutputEmbed, SelfAttention,
                               MLP, TransformerLayer, OptLM, get_filename,
