@@ -850,6 +850,13 @@ class OptLM:
         self.task = None
         self.init_all_weights()
 
+        self.w_percent = {}
+        self.keep_load_gpu_weight = False
+        self.compute = self.env.gpu
+        self.weight_load_dst = (
+            self.compute.compressed_device if policy.compress_weight else self.compute
+        )
+
     def set_task(self, task):
         self.task = task
         for l in self.layers:
@@ -882,6 +889,18 @@ class OptLM:
         else:
             self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
 
+        if self.keep_load_gpu_weight and i == 0:
+            weights = self.weight_read_buf[j].val
+            for idx, weight in enumerate(weights):
+                if (
+                    isinstance(weight, tuple)
+                    and weight[1]
+                    and weight[0].device == self.weight_load_dst
+                ):
+                    if self.weight_home[j].val[idx].device != self.weight_load_dst:
+                        self.weight_home[j].val[idx] = weight[0]
+                        break
+
         if j == 0:
             self.weight_stats = {
                 dev.name: 0 for dev in [self.env.gpu, self.env.cpu, self.env.disk]
@@ -892,7 +911,6 @@ class OptLM:
             self.weight_stats[dev_name] += size
             self.total_weight_size += size
 
-        ret = {}
         if j == self.num_layers - 1 and i == self.execute_gen_len - 1:
             for dev_name, size in self.weight_stats.items():
                 percent = (
@@ -901,9 +919,8 @@ class OptLM:
                     else 0
                 )
                 print(f"{dev_name}: {percent:.2f}% ({size / GB:.2f} GB)")
-                ret[dev_name] = percent
+                self.w_percent[dev_name] = percent
             print(f"Total Weight Size: {self.total_weight_size / GB:.2f} GB")
-        return ret
 
     def delete_weight(self, j, k):
         if k == 0:
@@ -1180,113 +1197,15 @@ class OptLM:
 
         return self.output_ids
 
-    def generation_loop_normal(self):
-        for i in range(self.execute_gen_len):
-            timers("generate").start()
-            for k in range(self.num_gpu_batches):
-                self.update_attention_mask(i, k)
-            for j in range(self.num_layers):
-                for k in range(self.num_gpu_batches):
-                    self.load_weight(i, j, k, overlap=False)
-
-                for k in range(self.num_gpu_batches):
-                    self.load_cache(i, j, k, overlap=False)
-                    self.load_hidden(i, j, k)
-                    self.compute_layer(i, j, k)
-                    self.store_hidden(i, j, k)
-                    self.store_cache(i, j, k, overlap=False)
-            timers("generate").stop()
-
-    def generation_loop_debug_normal(self):
-        execute_num_batches = 20
-        batch_ct = 0
-        pbar = tqdm(total=execute_num_batches)
-        timers("prefill_total").reset()
-        timers("decoding_gpu_batch").reset()
-
-        timers("load_weight").reset()
-        timers("load_cache_prefill").reset()
-        timers("load_cache_decoding").reset()
-        timers("store_cache_prefill").reset()
-        timers("store_cache_decoding").reset()
-        timers("compute_layer_prefill").reset()
-        timers("compute_layer_decoding").reset()
-        load_weight_timer = timers("load_weight")
-
-        for i in range(self.execute_gen_len):
-            if i == 0:
-                timers("prefill_total").start()
-                load_cache_timer = timers("load_cache_prefill")
-                store_cache_timer = timers("store_cache_prefill")
-                compute_layer_timer = timers("compute_layer_prefill")
-            else:
-                load_cache_timer = timers("load_cache_decoding")
-                store_cache_timer = timers("store_cache_decoding")
-                compute_layer_timer = timers("compute_layer_decoding")
-
-            for k in range(self.num_gpu_batches):
-                self.update_attention_mask(i, k)
-
-            for j in range(self.num_layers):
-                if i > 0:
-                    timers("decoding_gpu_batch").start()
-
-                load_weight_timer.start(self.sync)
-                for k in range(self.num_gpu_batches):
-                    self.load_weight(i, j, k)
-                load_weight_timer.stop(self.sync)
-
-                for k in range(self.num_gpu_batches):
-                    load_cache_timer.start(self.sync)
-                    self.load_cache(i, j, k)
-                    load_cache_timer.stop(self.sync)
-                    self.load_hidden(i, j, k)
-                    compute_layer_timer.start(self.sync)
-                    self.compute_layer(i, j, k)
-                    compute_layer_timer.stop(self.sync)
-                    self.store_hidden(i, j, k)
-                    store_cache_timer.start(self.sync)
-                    self.store_cache(i, j, k)
-                    store_cache_timer.stop(self.sync)
-
-                if i > 0:
-                    timers("decoding_gpu_batch").stop()
-                    pbar.update(1)
-                    batch_ct += 1
-                if batch_ct >= execute_num_batches:
-                    break
-            if batch_ct >= execute_num_batches:
-                break
-            if i == 0:
-                timers("prefill_total").stop(self.sync)
-
-        # Convert "decoding_gpu_batch" timer to "generate" timer
-        batch_cost = np.mean(timers("decoding_gpu_batch").costs[10:])
-        for i in range(self.execute_gen_len):
-            if i == 0:
-                timers("generate").costs.append(timers("prefill_total").costs[0])
-            else:
-                timers("generate").costs.append(self.num_layers * batch_cost)
-
-        # Debug the costs of individual functions
-        print(f"#layers: {self.num_layers}")
-
-        print(f"#batches prefill:  " f"{self.num_layers * self.num_gpu_batches}")
-        print(
-            f"#batches decoding: "
-            f"{(self.task.gen_len - 1) * self.num_layers * self.num_gpu_batches}"
-        )
-        print(
-            f"load_weight            (per-layer)"
-            f": {np.mean(timers('load_weight').costs):.6f} s"
-        )
-        for stage in ["prefill", "decoding"]:
-            for func in ["load_cache", "store_cache", "compute_layer"]:
-                name = func + "_" + stage
-                costs = timers(name).costs
-                print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
-
     def generation_loop_overlap_single_batch(self):
+        print(self.w_percent, self.policy.w_gpu_percent)
+        if (
+            self.w_percent != {}
+            and self.w_percent[self.env.gpu.name] < self.policy.w_gpu_percent / 100
+        ):
+            self.keep_load_gpu_weight = True
+        else:
+            self.keep_load_gpu_weight = False
         # Prologue
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, k)
@@ -1297,7 +1216,7 @@ class OptLM:
             timers("generate").start()
             self.update_attention_mask(i, 0)
             for j in range(self.num_layers):
-                w_percent = self.load_weight(i, j + 1, 0)
+                self.load_weight(i, j + 1, 0)
                 self.load_cache(i, j + 1, 0)
                 self.load_hidden(i, j, 0)
                 self.compute_layer(i, j, 0)
@@ -1308,131 +1227,6 @@ class OptLM:
 
             if self.task.stop and np.all(self.stopped):
                 break
-
-    def generation_loop_overlap_multi_batch(self):
-        # Prologue
-        for k in range(self.num_gpu_batches):
-            self.load_weight(0, 0, k)
-        self.load_hidden(0, 0, 0)
-        self.sync()
-
-        # Generate
-        for i in range(self.execute_gen_len):
-            timers("generate").start()
-            for k in range(self.num_gpu_batches):
-                self.update_attention_mask(i, k)
-            for j in range(self.num_layers):
-                for k in range(self.num_gpu_batches):
-                    self.load_weight(i, j + 1, k)
-                    self.load_cache(i, j, k + 1)
-                    self.store_hidden(i, j, k - 1)
-                    self.load_hidden(i, j, k + 1)
-                    self.compute_layer(i, j, k)
-                    self.store_cache(i, j, k - 1)
-                    self.sync()
-            timers("generate").stop()
-
-        # Epilogue
-        self.store_hidden(
-            self.execute_gen_len - 1, self.num_layers - 1, self.num_gpu_batches - 1
-        )
-
-    def generation_loop_debug_single_batch(self):
-        execute_num_batches = 20
-        batch_ct = 0
-        pbar = tqdm(total=execute_num_batches)
-        timers("prefill").reset()
-        timers("decoding_gpu_batch").reset()
-
-        # Prologue
-        for k in range(self.num_gpu_batches):
-            self.load_weight(0, 0, k)
-        self.sync()
-
-        # Generate
-        for i in range(self.execute_gen_len):
-            if i == 0:
-                timers("prefill").start()
-            self.update_attention_mask(i, 0)
-            for j in range(self.num_layers):
-                if i > 0:
-                    timers("decoding_gpu_batch").start()
-                self.load_weight(i, j + 1, 0)
-                self.load_cache(i, j + 1, 0)
-                self.load_hidden(i, j, 0)
-                self.compute_layer(i, j, 0)
-                self.store_cache(i, j - 1, 0)
-                self.store_hidden(i, j, 0)
-                self.sync()
-
-                if i > 0:
-                    timers("decoding_gpu_batch").stop()
-                    pbar.update(1)
-                    batch_ct += 1
-                if batch_ct >= execute_num_batches:
-                    break
-            if batch_ct >= execute_num_batches:
-                break
-            if i == 0:
-                timers("prefill").stop()
-
-        # Convert "decoding_gpu_batch" timer to "generate" timer
-        batch_cost = np.mean(timers("decoding_gpu_batch").costs[10:])
-        for i in range(self.execute_gen_len):
-            if i == 0:
-                timers("generate").costs.append(timers("prefill").costs[0])
-            else:
-                timers("generate").costs.append(self.num_layers * batch_cost)
-
-    def generation_loop_debug_multi_batch(self):
-        execute_num_batches = 20
-        batch_ct = 0
-        pbar = tqdm(total=execute_num_batches)
-        timers("prefill").reset()
-        timers("decoding_gpu_batch").reset()
-
-        # Prologue
-        for k in range(self.num_gpu_batches):
-            self.load_weight(0, 0, k)
-        self.load_hidden(0, 0, 0)
-        self.sync()
-
-        # Generate
-        for i in range(self.execute_gen_len):
-            if i == 0:
-                timers("prefill").start()
-            for k in range(self.num_gpu_batches):
-                self.update_attention_mask(i, k)
-            for j in range(self.num_layers):
-                if i > 0:
-                    timers("decoding_gpu_batch").start()
-                for k in range(self.num_gpu_batches):
-                    self.load_weight(i, j + 1, k)
-                    self.load_cache(i, j, k + 1)
-                    self.store_hidden(i, j, k - 1)
-                    self.load_hidden(i, j, k + 1)
-                    self.compute_layer(i, j, k)
-                    self.store_cache(i, j, k - 1)
-                    self.sync()
-
-                if i > 0:
-                    timers("decoding_gpu_batch").stop()
-                    pbar.update(1)
-                    batch_ct += 1
-                if batch_ct >= execute_num_batches:
-                    break
-            if batch_ct >= execute_num_batches:
-                break
-            if i == 0:
-                timers("prefill").stop()
-
-        # Convert "decoding_gpu_batch" timer to "generate" timer
-        batch_cost = np.mean(timers("decoding_gpu_batch").costs[10:])
-        for i in range(self.execute_gen_len):
-            if i == 0:
-                timers("generate").costs.append(timers("prefill").costs[0])
-            else:
-                timers("generate").costs.append(self.num_layers * batch_cost)
 
     def __del__(self):
         self.delete_all_weights()
