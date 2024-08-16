@@ -1213,7 +1213,7 @@ class OptLM:
     def generation_loop_overlap_single_batch(self):
         if (
             self.w_percent != {}
-            and self.w_percent[self.env.gpu.name] < self.policy.w_gpu_percent / 100
+            and self.w_percent[self.env.gpu.name] < self.policy.w_gpu_percent
         ):
             self.keep_load_gpu_weight = True
         else:
@@ -1243,7 +1243,7 @@ class OptLM:
     def generation_loop_overlap_multi_batch(self):
         if (
             self.w_percent != {}
-            and self.w_percent[self.env.gpu.name] < self.policy.w_gpu_percent / 100
+            and self.w_percent[self.env.gpu.name] < self.policy.w_gpu_percent
         ):
             self.keep_load_gpu_weight = True
         else:
