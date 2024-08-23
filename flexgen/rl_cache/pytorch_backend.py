@@ -1114,6 +1114,7 @@ def copy_worker_func(queue, cuda_id):
 
 
 def reshape_cache_home(old_cache_home, new_device, new_config, new_task, new_policy):
+    # TODO: Delete this function if unused
     # TODO: Use .resize_() or other methods to reshape TorchTensor in place
     old_k_cache, old_v_cache = old_cache_home
     new_k_cache, new_v_cache = new_device.init_cache_one_gpu_batch(

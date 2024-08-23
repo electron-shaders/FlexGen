@@ -118,17 +118,77 @@ cpu_weights = {}
 cpu_compressed_weights = {}
 
 
-def init_weight_list(weight_specs, policy, env):
+def get_cpu_weight(key, compress, shape, dtype, comp_weight_config, env):
     global cpu_weights, cpu_compressed_weights
+    if not compress:
+        cpu_weight = cpu_weights.get(key)
+        if cpu_weight is not None:
+            return cpu_weight.copy(env.cpu)
+    else:
+        cpu_weight = cpu_compressed_weights.get(key)
+        if cpu_weight is not None:
+            return cpu_weight.copy(env.cpu.compressed_device)
+
+    if cpu_weight is None:  # cpu_weights MISS, create and store it
+        if DUMMY_WEIGHT not in key:  # Use real weights, key == filename
+            if not compress:
+                cpu_weight = env.cpu.allocate(shape, dtype, pin_memory=True)
+                cpu_weight.load_from_np_file(key)
+                cpu_weights[key] = cpu_weight.copy(env.cpu)
+            else:
+                cpu_weight = env.cpu.compressed_device.allocate(
+                    shape, dtype, comp_weight_config, pin_memory=True
+                )
+                cpu_weight.load_from_np_file(key)
+                cpu_compressed_weights[key] = cpu_weight.copy(env.cpu.compressed_device)
+        else:  # Use dummy weights for benchmark purposes, key == shape
+            if not compress:
+                cpu_weight = env.cpu.allocate(shape, dtype, pin_memory=True)
+                cpu_weight.load_from_np(np.ones(shape, dtype))
+                cpu_weights[key] = cpu_weight.copy(env.cpu)
+            else:
+                cpu_weight = env.cpu.compressed_device.allocate(
+                    shape, dtype, comp_weight_config, pin_memory=True
+                )
+                for i in range(2):
+                    x = cpu_weight.data[i]
+                    x.load_from_np(np.ones(x.shape, torch_dtype_to_np_dtype[x.dtype]))
+                cpu_compressed_weights[key] = cpu_weight.copy(env.cpu.compressed_device)
+    return cpu_weight
+
+
+def init_cpu_weight(weight_specs, policy, env):
+    for weight_spec in weight_specs:
+        shape, dtype, filename = weight_spec
+
+        if len(shape) < 2:
+            compress = False
+        else:
+            compress = policy.compress_weight
+
+        key = filename if DUMMY_WEIGHT not in filename else shape
+        get_cpu_weight(key, compress, shape, dtype, policy.comp_weight_config, env)
+
+
+def set_weight_list(weight_home, weight_specs, policy, env):
     dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
     dev_choices = [env.disk, env.cpu, env.gpu]
 
     sizes = [np.prod(spec[0]) for spec in weight_specs]
     sizes_cumsum = np.cumsum(sizes)
-    ret = []
     for i in range(len(weight_specs)):
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
+
+        if (
+            weight_home.val[i] is not None
+            and home.device_type == weight_home.val[i].device.device_type
+        ):
+            continue
+
+        if weight_home.val[i] is not None:
+            weight_home.val[i].delete()
+
         shape, dtype, filename = weight_specs[i]
 
         if len(shape) < 2:
@@ -139,42 +199,13 @@ def init_weight_list(weight_specs, policy, env):
             compress = policy.compress_weight
 
         key = filename if DUMMY_WEIGHT not in filename else shape
-        if not compress:
-            cpu_weight = cpu_weights.get(key)
-        else:
-            cpu_weight = cpu_compressed_weights.get(key)
-
-        if cpu_weight is None:  # cpu_weights MISS, create and store it
-            if DUMMY_WEIGHT not in filename:  # Use real weights
-                if not compress:
-                    cpu_weight = env.cpu.allocate(shape, dtype, pin_memory=True)
-                    cpu_weight.load_from_np_file(filename)
-                    cpu_weights[key] = cpu_weight
-                else:
-                    cpu_weight = env.cpu.compressed_device.allocate(
-                        shape, dtype, policy.comp_weight_config, pin_memory=True
-                    )
-                    cpu_weight.load_from_np_file(filename)
-                    cpu_compressed_weights[key] = cpu_weight
-            else:  # Use dummy weights for benchmark purposes
-                if not compress:
-                    cpu_weight = env.cpu.allocate(shape, dtype, pin_memory=True)
-                    cpu_weight.load_from_np(np.ones(shape, dtype))
-                    cpu_weights[key] = cpu_weight
-                else:
-                    cpu_weight = env.cpu.compressed_device.allocate(
-                        shape, dtype, policy.comp_weight_config, pin_memory=True
-                    )
-                    for i in range(2):
-                        x = cpu_weight.data[i]
-                        x.load_from_np(
-                            np.ones(x.shape, torch_dtype_to_np_dtype[x.dtype])
-                        )
-                    cpu_compressed_weights[key] = cpu_weight
+        cpu_weight = get_cpu_weight(
+            key, compress, shape, dtype, policy.comp_weight_config, env
+        )
 
         if home.device_type == DeviceType.CPU:
             # CPU is chosen, append cpu_weight and continue
-            ret.append(cpu_weight)
+            weight_home.val[i] = cpu_weight
             continue
 
         if not compress:
@@ -190,8 +221,7 @@ def init_weight_list(weight_specs, policy, env):
         else:
             # GPU is chosen, copy from cpu_weight
             general_copy(weight, None, cpu_weight, None)
-        ret.append(weight)
-    return ret
+        weight_home.val[i] = weight
 
 
 class InputEmbed:
@@ -209,7 +239,7 @@ class InputEmbed:
     def set_task(self, task):
         self.task = task
 
-    def init_weight(self, weight_home, path):
+    def get_weight_specs(self, path):
         v, h, s, dtype = (
             self.config.vocab_size,
             self.config.input_dim,
@@ -217,15 +247,22 @@ class InputEmbed:
             self.config.dtype,
         )
         path = os.path.join(path, "")
-        weight_specs = [
+        return [
             # w_token
             ((v, h), dtype, path + "decoder.embed_tokens.weight"),
             # w_pos
             ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
         ]
-        weights = init_weight_list(weight_specs, self.policy, self.env)
 
-        weight_home.store(weights)
+    def init_weight(self, weight_home, path):
+        weight_specs = self.get_weight_specs(path)
+        init_cpu_weight(weight_specs, self.policy, self.env)
+
+        weight_home.store([None] * len(weight_specs))
+
+    def set_weight(self, weight_home, path):
+        weight_specs = self.get_weight_specs(path)
+        set_weight_list(weight_home, weight_specs, self.policy, self.env)
 
     def load_weight(self, weight_home, weight_read_buf, k):
         w_token, w_pos = weight_home.val
@@ -297,10 +334,10 @@ class OutputEmbed:
     def set_task(self, task):
         self.task = task
 
-    def init_weight(self, weight_home, path):
+    def get_weight_specs(self, path):
         v, h, dtype = (self.config.vocab_size, self.config.input_dim, self.config.dtype)
         path = os.path.join(path, "")
-        weight_specs = [
+        return [
             # w_ln
             ((h,), dtype, path + "decoder.layer_norm.weight"),
             # b_ln
@@ -308,9 +345,16 @@ class OutputEmbed:
             # w_token
             ((v, h), dtype, path + "decoder.embed_tokens.weight"),
         ]
-        weights = init_weight_list(weight_specs, self.policy, self.env)
 
-        weight_home.store(weights)
+    def init_weight(self, weight_home, path):
+        weight_specs = self.get_weight_specs(path)
+        init_cpu_weight(weight_specs, self.policy, self.env)
+
+        weight_home.store([None] * len(weight_specs))
+
+    def set_weight(self, weight_home, path):
+        weight_specs = self.get_weight_specs(path)
+        set_weight_list(weight_home, weight_specs, self.policy, self.env)
 
     def load_weight(self, weight_home, weight_read_buf, k):
         w_ln, b_ln, w_token = weight_home.val
@@ -389,12 +433,12 @@ class SelfAttention:
     def set_task(self, task):
         self.task = task
 
-    def init_weight(self, weight_home, path):
+    def get_weight_specs(self, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
         path = os.path.join(
             os.path.join(path, f"decoder.layers.{self.layer_id}.self_attn")
         )
-        weight_specs = [
+        return [
             # w_q
             ((h, h), dtype, path + ".q_proj.weight"),
             # b_q
@@ -416,8 +460,16 @@ class SelfAttention:
             # b_ln
             ((h,), dtype, path + "_layer_norm.bias"),
         ]
-        weights = init_weight_list(weight_specs, self.policy, self.env)
-        weight_home.store(weights)
+
+    def init_weight(self, weight_home, path):
+        weight_specs = self.get_weight_specs(path)
+        init_cpu_weight(weight_specs, self.policy, self.env)
+
+        weight_home.store([None] * len(weight_specs))
+
+    def set_weight(self, weight_home, path):
+        weight_specs = self.get_weight_specs(path)
+        set_weight_list(weight_home, weight_specs, self.policy, self.env)
 
     def load_weight(self, weight_home, weight_read_buf, k):
         w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln = weight_home.val
@@ -687,10 +739,10 @@ class MLP:
     def set_task(self, task):
         self.task = task
 
-    def init_weight(self, weight_home, path):
+    def get_weight_specs(self, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
         path = os.path.join(os.path.join(path, f"decoder.layers.{self.layer_id}."))
-        weight_specs = [
+        return [
             # wi
             ((4 * h, h), dtype, path + "fc1.weight"),
             # bi
@@ -704,8 +756,16 @@ class MLP:
             # b_ln
             ((h,), dtype, path + "final_layer_norm.bias"),
         ]
-        weights = init_weight_list(weight_specs, self.policy, self.env)
-        weight_home.store(weights)
+
+    def init_weight(self, weight_home, path):
+        weight_specs = self.get_weight_specs(path)
+        init_cpu_weight(weight_specs, self.policy, self.env)
+
+        weight_home.store([None] * len(weight_specs))
+
+    def set_weight(self, weight_home, path):
+        weight_specs = self.get_weight_specs(path)
+        set_weight_list(weight_home, weight_specs, self.policy, self.env)
 
     def load_weight(self, weight_home, weight_read_buf, k):
         wi, bi, wo, bo, w_ln, b_ln = weight_home.val
@@ -793,6 +853,11 @@ class TransformerLayer:
         self.attention.init_weight(home1, path)
         self.mlp.init_weight(home2, path)
         weight_home.store((home1, home2))
+
+    def set_weight(self, weight_home, path):
+        home1, home2 = weight_home.val
+        self.attention.set_weight(home1, path)
+        self.mlp.set_weight(home2, path)
 
     def load_weight(self, weight_home, weight_read_buf, k):
         read_buf1, read_buf2 = ValueHolder(), ValueHolder()
@@ -897,6 +962,14 @@ class OptLM:
             self.compute.compressed_device if policy.compress_weight else self.compute
         )
 
+    def set_policy(self, policy):
+        self.policy = policy
+        self.weight_load_dst = (
+            self.compute.compressed_device if policy.compress_weight else self.compute
+        )
+        for l in self.layers:
+            l.policy = policy
+
     def set_home(self, num_gpu_batches):
         self.cache_home = array_2d(self.num_layers, num_gpu_batches, ValueHolder)
         self.cache_read_buf = array_2d(self.num_layers, num_gpu_batches, ValueHolder)
@@ -917,6 +990,13 @@ class OptLM:
             download_opt_weights(self.config.name, self.path)
 
         self.layers[j].init_weight(self.weight_home[j], expanded_path)
+
+    def set_weight(self):
+        expanded_path = os.path.abspath(
+            os.path.expanduser(os.path.join(self.path, f"{self.config.name}-np"))
+        )
+        for j in range(self.num_layers):
+            self.layers[j].set_weight(self.weight_home[j], expanded_path)
 
     def load_weight(self, i, j, k, overlap=True):
         # Handle corner cases
@@ -1171,7 +1251,8 @@ class OptLM:
         overlap = self.policy.overlap
         prompt_len, gen_len = task.prompt_len, task.gen_len
         self.execute_gen_len = task.cut_gen_len if task.cut_gen_len else task.gen_len
-        self.policy = policy
+        self.set_policy(policy)
+        self.set_weight()
         self.set_home(self.policy.num_gpu_batches)
 
         # Output token ids
@@ -1349,6 +1430,11 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
 
 
 def run_flexgen(args):
+    batch_sizes = [1, 1, 1, 1, 1]
+    nums_gpu_batches = [2, 2, 2, 2, 2]
+    cache_gpu_percents = [100, 100, 100, 100, 100]
+    w_gpu_percents = [80, 60, 40, 20, 0]
+
     print(f"<run_flexgen>: args.model: {args.model}")
     if args.model == "facebook/galactica-30b":
         tokenizer = AutoTokenizer.from_pretrained(
@@ -1412,10 +1498,6 @@ def run_flexgen(args):
 
         print("benchmark - generate")
         timers("generate").reset()
-        batch_sizes = [2, 4, 8, 16, 32]
-        nums_gpu_batches = [2, 3, 4, 3, 2]
-        cache_gpu_percents = [80, 80, 80, 80, 80]
-        w_gpu_percents = [50, 50, 50, 50, 50]
 
         for batch_idx, (
             batch_size,
@@ -1436,6 +1518,8 @@ def run_flexgen(args):
             inputs = get_test_inputs(
                 prompt_len, batch_size * num_gpu_batches, tokenizer
             )
+            print("len(inputs):", len(inputs))
+            print("policy:", policy)
             output_ids = model.generate(
                 batch_idx,
                 policy,
