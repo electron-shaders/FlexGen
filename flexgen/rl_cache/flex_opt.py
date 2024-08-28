@@ -999,6 +999,10 @@ class OptLM:
             self.layers[j].set_weight(self.weight_home[j], expanded_path)
 
     def load_weight(self, i, j, k, overlap=True):
+        # Load weights only at the first batch
+        if k != 0:
+            return
+
         # Handle corner cases
         if j == self.num_layers:
             j = 0
