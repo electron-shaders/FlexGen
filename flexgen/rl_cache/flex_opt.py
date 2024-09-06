@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 from rl_cache.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
 from rl_cache.pytorch_backend import (
+    TorchCPUWeightTensorManager,
     TorchDevice,
     TorchDisk,
     TorchLink,
@@ -104,126 +105,6 @@ class Policy:
         return 100 - self.act_gpu_percent - self.act_cpu_percent
 
 
-def get_choice(cur_percent, percents, choices):
-    percents = np.cumsum(percents)
-    assert np.abs(percents[-1] - 100) < 1e-5
-
-    for i in range(len(percents)):
-        if cur_percent < percents[i]:
-            return choices[i]
-    return choices[-1]
-
-
-cpu_weights = {}
-cpu_compressed_weights = {}
-
-
-def get_cpu_weight(key, compress, shape, dtype, comp_weight_config, env):
-    global cpu_weights, cpu_compressed_weights
-    if not compress:
-        cpu_weight = cpu_weights.get(key)
-        if cpu_weight is not None:
-            return cpu_weight.copy(env.cpu)
-    else:
-        cpu_weight = cpu_compressed_weights.get(key)
-        if cpu_weight is not None:
-            return cpu_weight.copy(env.cpu.compressed_device)
-
-    if cpu_weight is None:  # cpu_weights MISS, create and store it
-        if DUMMY_WEIGHT not in key:  # Use real weights, key == filename
-            if not compress:
-                cpu_weight = env.cpu.allocate(shape, dtype, pin_memory=True)
-                cpu_weight.load_from_np_file(key)
-                cpu_weights[key] = cpu_weight.copy(env.cpu)
-            else:
-                cpu_weight = env.cpu.compressed_device.allocate(
-                    shape, dtype, comp_weight_config, pin_memory=True
-                )
-                cpu_weight.load_from_np_file(key)
-                cpu_compressed_weights[key] = cpu_weight.copy(env.cpu.compressed_device)
-        else:  # Use dummy weights for benchmark purposes, key == shape
-            if not compress:
-                cpu_weight = env.cpu.allocate(shape, dtype, pin_memory=True)
-                cpu_weight.load_from_np(np.ones(shape, dtype))
-                cpu_weights[key] = cpu_weight.copy(env.cpu)
-            else:
-                cpu_weight = env.cpu.compressed_device.allocate(
-                    shape, dtype, comp_weight_config, pin_memory=True
-                )
-                for i in range(2):
-                    x = cpu_weight.data[i]
-                    x.load_from_np(np.ones(x.shape, torch_dtype_to_np_dtype[x.dtype]))
-                cpu_compressed_weights[key] = cpu_weight.copy(env.cpu.compressed_device)
-    return cpu_weight
-
-
-def init_cpu_weight(weight_specs, policy, env):
-    for weight_spec in weight_specs:
-        shape, dtype, filename = weight_spec
-
-        if len(shape) < 2:
-            compress = False
-        else:
-            compress = policy.compress_weight
-
-        key = filename if DUMMY_WEIGHT not in filename else shape
-        get_cpu_weight(key, compress, shape, dtype, policy.comp_weight_config, env)
-
-
-def set_weight_list(weight_home, weight_specs, policy, env):
-    dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
-    dev_choices = [env.disk, env.cpu, env.gpu]
-
-    sizes = [np.prod(spec[0]) for spec in weight_specs]
-    sizes_cumsum = np.cumsum(sizes)
-    for i in range(len(weight_specs)):
-        mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
-        home = get_choice(mid_percent * 100, dev_percents, dev_choices)
-
-        if (
-            weight_home.val[i] is not None
-            and home.device_type == weight_home.val[i].device.device_type
-        ):
-            continue
-
-        if weight_home.val[i] is not None:
-            weight_home.val[i].delete()
-
-        shape, dtype, filename = weight_specs[i]
-
-        if len(shape) < 2:
-            pin_memory = True
-            compress = False
-        else:
-            pin_memory = policy.pin_weight
-            compress = policy.compress_weight
-
-        key = filename if DUMMY_WEIGHT not in filename else shape
-        cpu_weight = get_cpu_weight(
-            key, compress, shape, dtype, policy.comp_weight_config, env
-        )
-
-        if home.device_type == DeviceType.CPU:
-            # CPU is chosen, append cpu_weight and continue
-            weight_home.val[i] = cpu_weight
-            continue
-
-        if not compress:
-            weight = home.allocate(shape, dtype, pin_memory=pin_memory)
-        else:
-            weight = home.compressed_device.allocate(
-                shape, dtype, policy.comp_weight_config, pin_memory=pin_memory
-            )
-
-        if home.device_type == DeviceType.DISK:
-            # Disk is chosen, directly copy the weight file
-            weight.load_from_np_file(filename)
-        else:
-            # GPU is chosen, copy from cpu_weight
-            general_copy(weight, None, cpu_weight, None)
-        weight_home.val[i] = weight
-
-
 class InputEmbed:
     def __init__(self, config, env, policy):
         self.config = config
@@ -254,15 +135,15 @@ class InputEmbed:
             ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
         ]
 
-    def init_weight(self, weight_home, path):
+    def init_weight(self, weight_manager, weight_home, path):
         weight_specs = self.get_weight_specs(path)
-        init_cpu_weight(weight_specs, self.policy, self.env)
+        weight_manager.init_cpu_weight(weight_specs, self.policy)
 
         weight_home.store([None] * len(weight_specs))
 
-    def set_weight(self, weight_home, path):
+    def set_weight(self, weight_manager, weight_home, path):
         weight_specs = self.get_weight_specs(path)
-        set_weight_list(weight_home, weight_specs, self.policy, self.env)
+        weight_manager.set_weight_home(weight_home, weight_specs, self.policy)
 
     def load_weight(self, weight_home, weight_read_buf, k):
         w_token, w_pos = weight_home.val
@@ -346,15 +227,15 @@ class OutputEmbed:
             ((v, h), dtype, path + "decoder.embed_tokens.weight"),
         ]
 
-    def init_weight(self, weight_home, path):
+    def init_weight(self, weight_manager, weight_home, path):
         weight_specs = self.get_weight_specs(path)
-        init_cpu_weight(weight_specs, self.policy, self.env)
+        weight_manager.init_cpu_weight(weight_specs, self.policy)
 
         weight_home.store([None] * len(weight_specs))
 
-    def set_weight(self, weight_home, path):
+    def set_weight(self, weight_manager, weight_home, path):
         weight_specs = self.get_weight_specs(path)
-        set_weight_list(weight_home, weight_specs, self.policy, self.env)
+        weight_manager.set_weight_home(weight_home, weight_specs, self.policy)
 
     def load_weight(self, weight_home, weight_read_buf, k):
         w_ln, b_ln, w_token = weight_home.val
@@ -461,15 +342,15 @@ class SelfAttention:
             ((h,), dtype, path + "_layer_norm.bias"),
         ]
 
-    def init_weight(self, weight_home, path):
+    def init_weight(self, weight_manager, weight_home, path):
         weight_specs = self.get_weight_specs(path)
-        init_cpu_weight(weight_specs, self.policy, self.env)
+        weight_manager.init_cpu_weight(weight_specs, self.policy)
 
         weight_home.store([None] * len(weight_specs))
 
-    def set_weight(self, weight_home, path):
+    def set_weight(self, weight_manager, weight_home, path):
         weight_specs = self.get_weight_specs(path)
-        set_weight_list(weight_home, weight_specs, self.policy, self.env)
+        weight_manager.set_weight_home(weight_home, weight_specs, self.policy)
 
     def load_weight(self, weight_home, weight_read_buf, k):
         w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln = weight_home.val
@@ -757,15 +638,15 @@ class MLP:
             ((h,), dtype, path + "final_layer_norm.bias"),
         ]
 
-    def init_weight(self, weight_home, path):
+    def init_weight(self, weight_manager, weight_home, path):
         weight_specs = self.get_weight_specs(path)
-        init_cpu_weight(weight_specs, self.policy, self.env)
+        weight_manager.init_cpu_weight(weight_specs, self.policy)
 
         weight_home.store([None] * len(weight_specs))
 
-    def set_weight(self, weight_home, path):
+    def set_weight(self, weight_manager, weight_home, path):
         weight_specs = self.get_weight_specs(path)
-        set_weight_list(weight_home, weight_specs, self.policy, self.env)
+        weight_manager.set_weight_home(weight_home, weight_specs, self.policy)
 
     def load_weight(self, weight_home, weight_read_buf, k):
         wi, bi, wo, bo, w_ln, b_ln = weight_home.val
@@ -848,16 +729,16 @@ class TransformerLayer:
         self.attention.set_task(task)
         self.mlp.set_task(task)
 
-    def init_weight(self, weight_home, path):
+    def init_weight(self, weight_manager, weight_home, path):
         home1, home2 = ValueHolder(), ValueHolder()
-        self.attention.init_weight(home1, path)
-        self.mlp.init_weight(home2, path)
+        self.attention.init_weight(weight_manager, home1, path)
+        self.mlp.init_weight(weight_manager, home2, path)
         weight_home.store((home1, home2))
 
-    def set_weight(self, weight_home, path):
+    def set_weight(self, weight_manager, weight_home, path):
         home1, home2 = weight_home.val
-        self.attention.set_weight(home1, path)
-        self.mlp.set_weight(home2, path)
+        self.attention.set_weight(weight_manager, home1, path)
+        self.mlp.set_weight(weight_manager, home2, path)
 
     def load_weight(self, weight_home, weight_read_buf, k):
         read_buf1, read_buf2 = ValueHolder(), ValueHolder()
@@ -953,6 +834,7 @@ class OptLM:
         # self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
 
         self.task = None
+        self.weight_manager = TorchCPUWeightTensorManager(self.env)
         self.init_all_weights()
 
         self.w_percent = {}
@@ -989,14 +871,14 @@ class OptLM:
         if not os.path.exists(check_path) and DUMMY_WEIGHT not in check_path:
             download_opt_weights(self.config.name, self.path)
 
-        self.layers[j].init_weight(self.weight_home[j], expanded_path)
+        self.layers[j].init_weight(self.weight_manager, self.weight_home[j], expanded_path)
 
     def set_weight(self):
         expanded_path = os.path.abspath(
             os.path.expanduser(os.path.join(self.path, f"{self.config.name}-np"))
         )
         for j in range(self.num_layers):
-            self.layers[j].set_weight(self.weight_home[j], expanded_path)
+            self.layers[j].set_weight(self.weight_manager, self.weight_home[j], expanded_path)
 
     def load_weight(self, i, j, k, overlap=True):
         # Load weights only at the first batch
@@ -1019,17 +901,17 @@ class OptLM:
         else:
             self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
 
-        if self.keep_load_gpu_weight and i == 0:
-            weights = self.weight_read_buf[j].val
-            for idx, weight in enumerate(weights):
-                if (
-                    isinstance(weight, tuple)
-                    and weight[1]
-                    and weight[0].device == self.weight_load_dst
-                ):
-                    if self.weight_home[j].val[idx].device != self.weight_load_dst:
-                        self.weight_home[j].val[idx] = weight[0]
-                        break
+        # if self.keep_load_gpu_weight and i == 0:
+        #     weights = self.weight_read_buf[j].val
+        #     for idx, weight in enumerate(weights):
+        #         if (
+        #             isinstance(weight, tuple)
+        #             and weight[1]
+        #             and weight[0].device == self.weight_load_dst
+        #         ):
+        #             if self.weight_home[j].val[idx].device != self.weight_load_dst:
+        #                 self.weight_home[j].val[idx] = weight[0]
+        #                 break
 
         if j == 0:
             self.weight_stats = {
